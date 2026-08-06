@@ -1,9 +1,5 @@
 # Multi-Channel Autonomous Candidate Outreach (support WhatsApp and Voice AI)
 
-**An architecture for screening funnels at reachability: voice and WhatsApp agents that classify intent in real time, extract structured data, and write back to the ATS without an LLM call on every turn.**
-
-Two agent state machines — voice (Plivo) and WhatsApp (Meta Cloud API) — share one agent contract, run a 4-question / 6-question screening flow, and convert free-text conversations into structured ATS fields with a single LLM call per conversation.
-
 ---
 
 ## Problem
