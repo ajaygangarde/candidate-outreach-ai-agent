@@ -18,8 +18,6 @@ Partial replies get lost. A candidate who answers 3 of 6 WhatsApp questions and 
 
 ## Solution
 
-*Solution
-
 **Same playbook, two channels.** Voice and WhatsApp run on the same underlying design — just different scripts (voice: greet → ask → wrap up; WhatsApp: get consent → ask → wrap up). Adding a third channel later means reusing this playbook, not building from scratch.
 
 **Simple, event-driven logic** no heavy framework. Each message or call turn is handled as it comes in, triggered directly by the incoming webhook. No complex engine running in the background — just a straightforward decision at each step.
