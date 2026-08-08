@@ -64,17 +64,26 @@ go quiet get a nudge before their session is closed out — so partial answers a
 
 ```mermaid
 flowchart TB
-  recruiter["Recruiter UI<br/>create a campaign or an application"] --> queue["Outreach queue<br/>work waits here"]
-  queue --> dispatcher["Dispatcher<br/>picks the channel"]
+  recruiter["Recruiter UI"] -->|enqueue| queue["SQS: outreach queue"]
+  queue --> voiceWorker["Voice worker"]
+  queue --> waWorker["WhatsApp worker"]
 
-  dispatcher -->|voice| voiceAgent["Voice agent<br/>greet → ask → wrap up"]
-  dispatcher -->|whatsapp| waAgent["WhatsApp agent<br/>consent → ask → wrap up"]
+  voiceWorker --> plivo["Plivo"]
+  plivo --> voiceAgent["Voice agent\nintro → question → wrapup"]
+  voiceAgent --> cartesia["Cartesia TTS + Whisper STT"]
 
-  voiceAgent --> extract["AI extraction<br/>once per conversation"]
+  waWorker --> meta["Meta Graph API"]
+  meta --> waAgent["WhatsApp agent\nconsent → question → wrapup"]
+  waAgent --> pg[("PostgreSQL\nsession state")]
+
+  voiceAgent --> extract["LLM extraction\n(1 call / conversation)"]
   waAgent --> extract
-  extract --> ats[("Recruitment pipeline<br/>salary · notice · location · status")]
+  extract --> ats[("ATS tables\nstructured write-back")]
 
-  nudge["Reminder worker<br/>nudges quiet candidates"] --> waAgent
+  abandonWorker["Abandonment worker\n18h nudge / 24h finalize"] --> pg
+  ecs["ECS · PM2 processes"] --> voiceWorker
+  ecs --> waWorker
+  ecs --> abandonWorker
 ```
 
 The recruiter's screen never waits on a phone call or a WhatsApp send. Work is handed to a queue and
