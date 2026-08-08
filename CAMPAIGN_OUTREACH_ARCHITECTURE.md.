@@ -1,0 +1,215 @@
+# Multi-Channel Autonomous Candidate Outreach (WhatsApp + Voice AI)
+
+Autonomous agents that reach job seekers on WhatsApp or by phone, run a structured screening
+conversation, and write typed results back into the recruitment pipeline — with a human involved
+only on explicit escalation.
+
+> **This is the engineering deep dive** — queue dispatch, retry policy, dead-letter handling and
+> idempotency. For the non-technical walkthrough, see
+> [CAMPAIGN_OUTREACH_OVERVIEW.md](./CAMPAIGN_OUTREACH_OVERVIEW.md).
+
+---
+
+## Problem
+
+Before a recruiter talks to a candidate, someone has to collect five basics: current salary,
+expected salary, notice period, location, and work status. Doing this by hand doesn't scale — and
+"just plug in an AI" breaks in three ways:
+
+**One channel isn't enough.** Some candidates never answer calls; others never reply to texts. You
+need both voice and WhatsApp — but building them as separate systems doubles the work.
+
+**Conversations don't become data on their own.** A great call still just leaves a sentence in a
+notes field, not a searchable, filterable record.
+
+**Partial replies get lost.** A candidate who answers 3 of 6 WhatsApp questions and goes quiet is
+still valuable — but without tracking progress, that looks identical to never replying at all.
+
+---
+
+## Solution
+
+**Same playbook, two channels.** Voice and WhatsApp run on the same underlying design — just
+different scripts (voice: greet → ask → wrap up; WhatsApp: get consent → ask → wrap up). Adding a
+third channel later means reusing this playbook, not building from scratch.
+
+**Simple, event-driven logic** — no heavy framework. Each message or call turn is handled as it
+comes in, triggered directly by the incoming webhook. No complex engine running in the background,
+just a straightforward decision at each step.
+
+**Memory that fits how each channel behaves.** A voice call is a live, ~30-second conversation, so
+its state lives in memory for that call. WhatsApp replies can come hours later from anywhere, so its
+state is saved in the database and picked up wherever it left off.
+
+**Most replies are understood instantly, without AI.** Simple word-matching — including
+Hindi-English mixed phrases like *haan*, *nahi*, *kitna* — handles the overwhelming majority of
+replies immediately, for free. AI only steps in for the tricky ones.
+
+**Voice never makes the candidate wait.** Every question is pre-recorded in advance, and the next
+question is prepared in the background while the candidate is still answering the current one — so
+there's no dead air.
+
+**One AI call per conversation, not per message.** Instead of asking AI to think on every reply,
+it's used once at the end — to read the whole conversation, pull out salary, notice period,
+location, and save them directly to the system.
+
+**Nothing gets lost.** Duplicate messages are ignored, failed sends are retried, and candidates who
+go quiet get a nudge before their session is closed out — so partial answers are never thrown away.
+
+**Built to grow.** Adding a new channel (like SMS) reuses the same core pieces.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TB
+  recruiter["Recruiter UI<br/>campaign create · application create"] -->|enqueueOutreach| queue["SQS: outreach queue<br/>one queue, all channels"]
+  queue -->|long poll · 20s| dispatcher["Outreach dispatcher<br/>routes on body.channel"]
+
+  dispatcher -->|voice| voiceH["voice.handler<br/>10s gap per candidate"]
+  dispatcher -->|whatsapp| waH["whatsapp.handler<br/>concurrent sends"]
+  dispatcher -->|email| emailH["email.handler"]
+
+  voiceH --> plivo["Plivo"]
+  plivo --> voiceAgent["Voice agent<br/>intro → question → wrapup"]
+  voiceAgent --> cartesia["Cartesia TTS + Whisper STT"]
+
+  waH --> meta["Meta Graph API"]
+  meta --> waAgent["WhatsApp agent<br/>consent → question → wrapup"]
+  waAgent --> pg[("PostgreSQL<br/>session state + processing_jobs")]
+
+  queue -.->|maxReceiveCount 3| dlq["Dead-letter queue"]
+
+  voiceAgent --> extract["LLM extraction<br/>(1 call / conversation)"]
+  waAgent --> extract
+  extract --> ats[("ATS tables<br/>structured write-back")]
+
+  abandonWorker["Abandonment worker<br/>18h nudge / 24h finalize"] --> pg
+  ecs["ECS · PM2 processes"] --> dispatcher
+  ecs --> abandonWorker
+```
+
+**Stack:** Node/Express · Plivo (voice) · Meta Graph API (WhatsApp, direct, no SDK) · Cartesia TTS +
+Whisper STT · `gpt-4o-mini` with `gemini-2.5-flash` fallback · PostgreSQL (JSONB session state) ·
+SQS · ECS/PM2.
+
+---
+
+## How work is dispatched
+
+**One queue, not one per channel.** Both entry points — creating a campaign and creating a single
+application — call the same `enqueueOutreach(payload)` with a `channel` field on the message body. A
+single dispatcher process long-polls that queue and routes each message to a channel handler. Adding
+email meant adding a handler and a switch case, not a queue, a worker, an IAM policy and a deploy
+target.
+
+**The queue absorbs the difference in channel physics.** Plivo rate-limits outbound calls, so the
+voice handler walks its candidate list with a 10-second gap. WhatsApp has no such limit, so its
+handler fans out concurrently with `Promise.allSettled`. Both look identical to the producer:
+enqueue a batch, return. The recruiter's HTTP request never waits on a phone call or a Meta API
+round trip.
+
+**Deletion is a decision, not a default.** Every handler returns `{ success, deleteMessage, reason }`,
+and the dispatcher deletes the message only when told to. That distinction is the whole retry policy:
+
+- A **permanent** failure — a 4xx from Meta, a malformed job description — is deleted. Retrying
+  produces the same failure and burns quota.
+- A **transient** failure — a timeout, a network blip — is left alone. The visibility timeout
+  expires and the message reappears for another attempt.
+- After **3 failed receives**, the redrive policy moves it to a dead-letter queue, where it can be
+  inspected rather than lost.
+
+Long polling (20s wait, up to 10 messages per receive) keeps the dispatcher near-idle between
+campaigns instead of hammering the API on an interval.
+
+---
+
+## How duplicate work is prevented
+
+Retries are the price of the design above, and retries mean the same job arrives more than once.
+Three sources: SQS at-least-once delivery, a worker crashing mid-job and its message reappearing,
+and Meta re-sending webhooks aggressively until it gets a 200.
+
+**A Postgres table is the lock.** `processing_jobs` has a unique constraint on `idempotency_key`,
+and acquiring a lock is a single atomic statement:
+
+```sql
+INSERT INTO processing_jobs (idempotency_key, status, worker_id, expires_at, ...)
+VALUES (...) ON CONFLICT (idempotency_key) DO NOTHING
+```
+
+The insert either wins or it doesn't. No read-then-write race, no separate lock service.
+
+**Locks are leases, not flags.** Each holds an `expires_at` (5 minutes by default), so a worker that
+dies mid-job doesn't block that job forever — the next worker sees an expired lease and takes it
+over, incrementing `attempt_count`. Long-running jobs call `extendLock` to keep the lease alive
+rather than being reclaimed while still working. Acquisition returns one of five outcomes —
+`new_lock`, `already_completed`, `retry_failed`, `stale_lock_takeover`, `lock_held_by_other` — and
+the caller acts on the distinction instead of a bare boolean.
+
+**Completed and failed are treated differently on purpose.** `COMPLETED` means skip: the work is
+done and re-running it would double-send. `FAILED` means take over and retry, because a job that
+failed on a transient error should not be permanently poisoned by its own failure record.
+
+**Keys name the unit of work, not the message.**
+
+| Job | Key |
+|---|---|
+| Outreach send | `outreach:{channel}:{applicationCallId}` |
+| Resume scoring | `resume:{resumeId}:app:{applicationId}:job:{jobPostId}` |
+| Inbound WhatsApp reply | `whatsapp:inbound:{phoneNumberId}:{messageId}` |
+
+Because the key is derived from domain identifiers, two different SQS messages describing the same
+work collapse onto the same lock.
+
+**The webhook path leans on this hardest.** Meta retries until it gets a 200, so the endpoint returns
+200 immediately and processes the message fire-and-forget. Every duplicate delivery resolves to the
+same inbound key and is dropped at the lock. Admin re-score is the deliberate escape hatch:
+`clearLock` deletes the row so the pipeline will genuinely reprocess a completed job. Completed locks
+older than 7 days are swept by a cleanup job.
+
+SQS FIFO's built-in deduplication wasn't sufficient here — its 5-minute window is producer-side only,
+and the duplicates that actually matter come from consumer crashes and webhook retries across process
+restarts.
+
+---
+
+## Result
+
+- **End-to-end autonomy** — dial/message → converse → classify → extract → update the ATS, with a
+  human in the loop only on explicit escalation.
+- **One contract, two channels** — a third channel is a config + node triple, not a new system.
+- **Structured data, not transcripts** — five ATS fields populated automatically on every completed
+  conversation.
+- **Durable by construction** — conversations survive restarts, duplicate webhooks, and candidate
+  abandonment without data loss.
+- **Cost and latency bounded architecturally** — one LLM call per conversation, not per turn; no
+  synchronous TTS on the voice critical path.
+
+---
+
+## Extending it
+
+- **Add a new question:** update the config file — no database changes needed.
+- **Add a new channel (e.g. SMS):** write a handler, add a switch case in the dispatcher, and reuse
+  the same agent contract, screening config and write-back path.
+- **Teach it a new phrase:** add it to the keyword list. Anything unrecognized still falls back to
+  AI, so nothing goes unanswered.
+
+---
+
+## What's next
+
+- Move voice session state out of in-process memory to support horizontal scaling.
+- Add real-time streaming voice to support barge-in (candidate interrupting mid-prompt).
+- Promote screening questions from code config to a database table for per-job customization without
+  a deploy.
+- Add automated tests around the agent node functions — they're pure `(state, context) → result`,
+  which makes them cheap to cover.
+- **Persist WhatsApp delivery-status callbacks.** `sent` / `delivered` / `failed` arrive
+  asynchronously *after* the send path has already reported success, so an undelivered candidate is
+  currently indistinguishable from a contacted one in the database.
+- **Make the outreach queue URL required** rather than falling back to the legacy voice queue. A
+  misconfigured environment silently publishes WhatsApp work onto the old queue, where a
+  channel-unaware consumer can pick it up and place a phone call instead.
