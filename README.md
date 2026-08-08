@@ -6,7 +6,7 @@ only on explicit escalation.
 
 > **This is the overview.** For the engineering deep dive — queue dispatch, retry policy,
 > dead-letter handling and idempotency — see
-> [CAMPAIGN_OUTREACH_ARCHITECTURE.md](./CAMPAIGN_OUTREACH_ARCHITECTURE.md).
+ ### https://github.com/ajaygangarde/candidate-outreach-ai-agent/blob/main/CAMPAIGN_OUTREACH_ARCHITECTURE.md.
 
 ---
 
