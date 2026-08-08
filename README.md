@@ -85,7 +85,34 @@ flowchart TB
   ecs --> waWorker
   ecs --> abandonWorker
 ```
+### Detailed Flow 
+```mermaid
+flowchart TB
+  recruiter["Recruiter UI<br/>campaign create · application create"] -->|enqueueOutreach| queue["SQS: outreach queue<br/>one queue, all channels"]
+  queue -->|long poll · 20s| dispatcher["Outreach dispatcher<br/>routes on body.channel"]
 
+  dispatcher -->|voice| voiceH["voice.handler<br/>10s gap per candidate"]
+  dispatcher -->|whatsapp| waH["whatsapp.handler<br/>concurrent sends"]
+  dispatcher -->|email| emailH["email.handler"]
+
+  voiceH --> plivo["Plivo"]
+  plivo --> voiceAgent["Voice agent<br/>intro → question → wrapup"]
+  voiceAgent --> cartesia["Cartesia TTS + Whisper STT"]
+
+  waH --> meta["Meta Graph API"]
+  meta --> waAgent["WhatsApp agent<br/>consent → question → wrapup"]
+  waAgent --> pg[("PostgreSQL<br/>session state + processing_jobs")]
+
+  queue -.->|maxReceiveCount 3| dlq["Dead-letter queue"]
+
+  voiceAgent --> extract["LLM extraction<br/>(1 call / conversation)"]
+  waAgent --> extract
+  extract --> ats[("ATS tables<br/>structured write-back")]
+
+  abandonWorker["Abandonment worker<br/>18h nudge / 24h finalize"] --> pg
+  ecs["ECS · PM2 processes"] --> dispatcher
+  ecs --> abandonWorker
+  ```
 The recruiter's screen never waits on a phone call or a WhatsApp send. Work is handed to a queue and
 returns immediately; the conversation happens in the background and results appear in the pipeline
 when it completes.
